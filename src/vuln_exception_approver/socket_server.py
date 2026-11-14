@@ -15,13 +15,14 @@ from pydantic import ValidationError
 from vuln_exception_approver.decision_engine import evaluate_exception_request
 from vuln_exception_approver.git_manager import GitManager
 from vuln_exception_approver.register_updater import (
-    update_register_json,
-    update_register_markdown,
+    update_register_batch_json,
+    update_register_batch_markdown,
     update_ticket_markdown,
 )
 from vuln_exception_approver.schemas import (
     ApprovalDecision,
     ApprovalRequest,
+    ApprovalStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,22 @@ class UdsApproverServer:
                     if decision:
                         decisions.append(decision)
 
+                if decisions:
+                    register_json = self.repo_dir / "register" / "vulnerability_register.json"
+                    register_md = self.repo_dir / "register" / "vulnerability_register.md"
+                    update_register_batch_json(register_json, decisions)
+                    update_register_batch_markdown(register_md, decisions)
+
+                    approved_count = sum(
+                        1 for d in decisions if d.status == ApprovalStatus.APPROVED
+                    )
+                    rejected_count = len(decisions) - approved_count
+                    commit_msg = (
+                        f"chore(governance): processed {len(decisions)} decisions "
+                        f"({approved_count} approved, {rejected_count} rejected)"
+                    )
+                    self.git_manager.commit_batch(commit_msg)
+
                 response = [d.model_dump(mode="json") for d in decisions]
                 conn.sendall(json.dumps(response, indent=2).encode("utf-8"))
 
@@ -173,15 +190,6 @@ class UdsApproverServer:
         # Update ticket markdown
         if full_ticket_path.exists():
             update_ticket_markdown(full_ticket_path, decision)
-
-        # Update vulnerability register JSON and Markdown
-        register_json = self.repo_dir / "register" / "vulnerability_register.json"
-        register_md = self.repo_dir / "register" / "vulnerability_register.md"
-        update_register_json(register_json, decision)
-        update_register_markdown(register_md, decision)
-
-        # Commit to Git repository
-        self.git_manager.commit_decision(decision)
 
         return decision
 

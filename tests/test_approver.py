@@ -238,3 +238,30 @@ def test_update_register_json_and_markdown(tmp_path):
     assert update_register_markdown(reg_md, decision) is True
     updated_md = reg_md.read_text(encoding="utf-8")
     assert "| CVE-2024-38077 | libarchive13 | 3.6.2-1 | HIGH | 0.0004 | APPROVED | [EXC-0001](tickets/EXC-0001.md) | 2026-12-14 |" in updated_md
+
+
+def test_update_register_batch(tmp_path):
+    """Test batch update of register JSON with multiple decisions."""
+    from vuln_exception_approver.register_updater import update_register_batch_json
+
+    reg_json = tmp_path / "vulnerability_register.json"
+    decisions = [
+        ApprovalDecision(
+            cve_id=f"CVE-2024-{i:04d}",
+            package_name=f"pkg-{i}",
+            status=ApprovalStatus.APPROVED if i % 2 == 0 else ApprovalStatus.REJECTED,
+            decision_reason="Batch decision",
+            epss_score=0.001 * i,
+            in_memory=False,
+            approved_at=datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC),
+            expires_at=datetime(2026, 12, 14, 12, 0, 0, tzinfo=UTC) if i % 2 == 0 else None,
+            remediation_sla_deadline=datetime(2026, 11, 21, 12, 0, 0, tzinfo=UTC) if i % 2 != 0 else None,
+        )
+        for i in range(1, 5)
+    ]
+
+    assert update_register_batch_json(reg_json, decisions) is True
+    data = json.loads(reg_json.read_text(encoding="utf-8"))
+    assert data["total_tracked"] == 4
+    assert data["active_exceptions"] == 2
+    assert len(data["vulnerabilities"]) == 4

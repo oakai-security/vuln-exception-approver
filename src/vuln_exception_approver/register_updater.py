@@ -115,6 +115,16 @@ def update_register_json(
     register_json_path: Path, decision: ApprovalDecision
 ) -> bool:
     """Update entry in vulnerability_register.json."""
+    return update_register_batch_json(register_json_path, [decision])
+
+
+def update_register_batch_json(
+    register_json_path: Path, decisions: list[ApprovalDecision]
+) -> bool:
+    """Update multiple entries in vulnerability_register.json in a single atomic write."""
+    if not decisions:
+        return True
+
     if not register_json_path.exists():
         logger.warning(
             "Register JSON not found at %s. Creating new register.",
@@ -137,58 +147,66 @@ def update_register_json(
             return False
 
     vulns: list[dict[str, Any]] = register_data.get("vulnerabilities", [])
-    entry_found = False
 
-    expires_str = (
-        decision.expires_at.strftime("%Y-%m-%d")
-        if decision.expires_at
-        else None
-    )
-    deadline_str = (
-        decision.remediation_sla_deadline.strftime("%Y-%m-%d")
-        if decision.remediation_sla_deadline
-        else None
-    )
-
-    for entry in vulns:
-        if (
-            entry.get("cve_id") == decision.cve_id
-            and entry.get("package_name") == decision.package_name
-        ):
-            entry["status"] = decision.status.value
-            entry["evaluated_by"] = decision.evaluated_by
-            entry["evaluated_at"] = decision.evaluated_at.isoformat()
-            entry["decision_reason"] = decision.decision_reason
-            entry["expires_at"] = expires_str
-            entry["remediation_deadline"] = deadline_str
-            entry_found = True
-            break
-
-    if not entry_found:
-        vulns.append(
-            {
-                "cve_id": decision.cve_id,
-                "package_name": decision.package_name,
-                "status": decision.status.value,
-                "epss_score": decision.epss_score,
-                "in_memory": decision.in_memory,
-                "evaluated_by": decision.evaluated_by,
-                "evaluated_at": decision.evaluated_at.isoformat(),
-                "decision_reason": decision.decision_reason,
-                "expires_at": expires_str,
-                "remediation_deadline": deadline_str,
-            }
+    for decision in decisions:
+        expires_str = (
+            decision.expires_at.strftime("%Y-%m-%d")
+            if decision.expires_at
+            else None
         )
+        deadline_str = (
+            decision.remediation_sla_deadline.strftime("%Y-%m-%d")
+            if decision.remediation_sla_deadline
+            else None
+        )
+
+        entry_found = False
+        for entry in vulns:
+            if (
+                entry.get("cve_id") == decision.cve_id
+                and entry.get("package_name") == decision.package_name
+            ):
+                entry["status"] = decision.status.value
+                entry["evaluated_by"] = decision.evaluated_by
+                entry["evaluated_at"] = decision.evaluated_at.isoformat()
+                entry["decision_reason"] = decision.decision_reason
+                entry["expires_at"] = expires_str
+                entry["remediation_deadline"] = deadline_str
+                entry_found = True
+                break
+
+        if not entry_found:
+            vulns.append(
+                {
+                    "cve_id": decision.cve_id,
+                    "package_name": decision.package_name,
+                    "status": decision.status.value,
+                    "epss_score": decision.epss_score,
+                    "in_memory": decision.in_memory,
+                    "evaluated_by": decision.evaluated_by,
+                    "evaluated_at": decision.evaluated_at.isoformat(),
+                    "decision_reason": decision.decision_reason,
+                    "expires_at": expires_str,
+                    "remediation_deadline": deadline_str,
+                }
+            )
 
     register_data["vulnerabilities"] = vulns
     register_data["last_updated"] = _utc_now().isoformat()
+    register_data["total_tracked"] = len(vulns)
+    register_data["active_exceptions"] = sum(
+        1 for v in vulns if v.get("status") == "APPROVED"
+    )
+    register_data["pending_review"] = sum(
+        1 for v in vulns if v.get("status") == "PENDING_REVIEW"
+    )
 
     try:
         register_json_path.parent.mkdir(parents=True, exist_ok=True)
         register_json_path.write_text(
             json.dumps(register_data, indent=2) + "\n", encoding="utf-8"
         )
-        logger.info("Updated register JSON at %s", register_json_path)
+        logger.info("Updated register JSON with %d decisions", len(decisions))
         return True
     except OSError as err:
         logger.error("Failed to write register JSON %s: %s", register_json_path, err)
@@ -199,6 +217,13 @@ def update_register_markdown(
     register_md_path: Path, decision: ApprovalDecision
 ) -> bool:
     """Update Markdown register table with approval decision."""
+    return update_register_batch_markdown(register_md_path, [decision])
+
+
+def update_register_batch_markdown(
+    register_md_path: Path, decisions: list[ApprovalDecision]
+) -> bool:
+    """Update Markdown register table with multiple approval decisions."""
     if not register_md_path.exists():
         logger.warning(
             "Register Markdown not found at %s. Skipping Markdown update.",
@@ -214,37 +239,53 @@ def update_register_markdown(
 
     lines = content.splitlines()
     new_lines: list[str] = []
-    updated = False
+    any_updated = False
 
-    target_pattern = f"| {decision.cve_id} | {decision.package_name} |"
-    deadline_str = (
-        decision.expires_at.strftime("%Y-%m-%d")
-        if decision.expires_at
-        else (
-            decision.remediation_sla_deadline.strftime("%Y-%m-%d")
-            if decision.remediation_sla_deadline
-            else "N/A"
-        )
-    )
+    # Map of (cve_id, package_name) to decision
+    decision_map = {(d.cve_id, d.package_name): d for d in decisions}
 
     for line in lines:
-        if line.startswith(target_pattern):
-            # Parse existing columns
-            cols = [c.strip() for c in line.split("|")[1:-1]]
-            if len(cols) >= 8:
-                # Update status and expiration/deadline columns
-                cols[5] = decision.status.value
-                cols[7] = deadline_str
-                new_line = "| " + " | ".join(cols) + " |"
-                new_lines.append(new_line)
-                updated = True
-                continue
-        new_lines.append(line)
+        matched = False
+        for (cve, pkg), decision in decision_map.items():
+            pattern_plain = f"| {cve} | {pkg} |"
+            pattern_ticks = f"| `{cve}` | `{pkg}` |"
 
-    if updated:
+            deadline_str = (
+                decision.expires_at.strftime("%Y-%m-%d")
+                if decision.expires_at
+                else (
+                    decision.remediation_sla_deadline.strftime("%Y-%m-%d")
+                    if decision.remediation_sla_deadline
+                    else "N/A"
+                )
+            )
+
+            if line.startswith(pattern_plain):
+                cols = [c.strip() for c in line.split("|")[1:-1]]
+                if len(cols) >= 8:
+                    cols[5] = decision.status.value
+                    cols[7] = deadline_str
+                    new_lines.append("| " + " | ".join(cols) + " |")
+                    matched = True
+                    any_updated = True
+                    break
+            elif line.startswith(pattern_ticks):
+                cols = [c.strip() for c in line.split("|")[1:-1]]
+                if len(cols) >= 9:
+                    cols[7] = f"**{decision.status.value}**"
+                    cols[8] = f"`{deadline_str}`"
+                    new_lines.append("| " + " | ".join(cols) + " |")
+                    matched = True
+                    any_updated = True
+                    break
+
+        if not matched:
+            new_lines.append(line)
+
+    if any_updated:
         try:
             register_md_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-            logger.info("Updated register Markdown at %s", register_md_path)
+            logger.info("Updated register Markdown with %d decisions", len(decisions))
             return True
         except OSError as err:
             logger.error("Failed to write register Markdown %s: %s", register_md_path, err)

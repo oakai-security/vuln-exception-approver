@@ -16,8 +16,8 @@ class GitManager:
         self.repo_dir = Path(repo_dir)
         self.auto_push = auto_push
 
-    def commit_decision(self, decision: ApprovalDecision) -> bool:
-        """Stage tickets/ and register/, and commit with a conventional commit message."""
+    def commit_batch(self, commit_msg: str) -> bool:
+        """Stage tickets/ and register/, and commit the batch with a conventional commit message."""
         git_dir = self.repo_dir / ".git"
         if not git_dir.exists() and not (self.repo_dir / "../.git").exists():
             logger.info(
@@ -48,13 +48,9 @@ class GitManager:
             )
 
             if not status_res.stdout.strip():
-                logger.info("No git changes to commit for %s", decision.cve_id)
+                logger.info("No git changes to commit in batch")
                 return True
 
-            status_lower = decision.status.value.lower()
-            commit_msg = (
-                f"chore(governance): {status_lower} exception for {decision.cve_id} ({decision.package_name})"
-            )
             subprocess.run(
                 [
                     "git",
@@ -74,7 +70,7 @@ class GitManager:
                 timeout=15,
                 check=True,
             )
-            logger.info("Committed governance decision: %s", commit_msg)
+            logger.info("Committed governance batch in vuln-register: %s", commit_msg)
 
             if self.auto_push:
                 subprocess.run(
@@ -90,5 +86,13 @@ class GitManager:
             return True
 
         except (subprocess.SubprocessError, OSError) as err:
-            logger.error("Git operation failed in %s: %s", self.repo_dir, err)
+            logger.error("Git governance batch operation failed in %s: %s", self.repo_dir, err)
             return False
+
+    def commit_decision(self, decision: ApprovalDecision) -> bool:
+        """Stage tickets/ and register/, and commit with a conventional commit message."""
+        status_lower = decision.status.value.lower()
+        commit_msg = (
+            f"chore(governance): {status_lower} exception for {decision.cve_id} ({decision.package_name})"
+        )
+        return self.commit_batch(commit_msg)

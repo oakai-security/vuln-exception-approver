@@ -50,8 +50,35 @@ def evaluate_exception_request(request: ApprovalRequest) -> ApprovalDecision:
             evaluated_at=now,
         )
 
-    # Gate 2: Check EPSS exploit threshold
+    # Gate 2: Check EPSS exploit threshold with Compensating Control evaluation
     if request.epss_score >= EPSS_APPROVAL_THRESHOLD:
+        if request.compensating_control_active:
+            ctrl_ref = request.compensating_control_ref or "verified runtime defense"
+            expires_at, lifespan_days = calculate_expiration("HIGH", from_date=now)
+            reason = (
+                f"Conditional exception approved: EPSS score {request.epss_score:.4f} meets or exceeds "
+                f"threshold {EPSS_APPROVAL_THRESHOLD:.2f}, but verified compensating control "
+                f"({ctrl_ref}) is active in runtime. Valid for {lifespan_days} days under telemetry."
+            )
+            logger.info(
+                "[%s] Conditionally approved via compensating control: %s",
+                request.cve_id,
+                ctrl_ref,
+            )
+            return ApprovalDecision(
+                cve_id=request.cve_id,
+                package_name=request.package_name,
+                status=ApprovalStatus.APPROVED,
+                decision_reason=reason,
+                epss_score=request.epss_score,
+                in_memory=False,
+                approved_at=now,
+                expires_at=expires_at,
+                compensating_control_active=True,
+                compensating_control_ref=ctrl_ref,
+                evaluated_at=now,
+            )
+
         reason = (
             f"Exception rejected: EPSS score {request.epss_score:.4f} meets or exceeds "
             f"the risk threshold of {EPSS_APPROVAL_THRESHOLD:.2f}."

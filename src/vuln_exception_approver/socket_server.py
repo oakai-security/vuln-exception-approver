@@ -157,6 +157,8 @@ class UdsApproverServer:
         severity = item.get("severity", item.get("threat_level", "MEDIUM"))
         epss = float(item.get("epss_score", 0.0))
         in_mem = bool(item.get("in_memory", False))
+        comp_active = bool(item.get("compensating_control_active", False))
+        comp_ref = item.get("compensating_control_ref", None)
 
         ticket_id = item.get("id", item.get("ticket_id", ""))
         rel_ticket_path = item.get("ticket_path", "")
@@ -181,6 +183,8 @@ class UdsApproverServer:
             epss_score=epss,
             in_memory=in_mem,
             ticket_path=str(full_ticket_path),
+            compensating_control_active=comp_active,
+            compensating_control_ref=comp_ref,
             justification=justification,
             requested_at=datetime.now(UTC),
         )

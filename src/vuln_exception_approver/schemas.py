@@ -35,6 +35,14 @@ class ApprovalRequest(BaseModel):
         default=True,
         description="True if automated patching and safe purging were attempted and failed",
     )
+    compensating_control_active: bool = Field(
+        default=False,
+        description="True if an active runtime compensating control (e.g. Falco eBPF rule) is verified",
+    )
+    compensating_control_ref: str | None = Field(
+        default=None,
+        description="Identifier or rule filename of the active compensating control",
+    )
     justification: str = Field(..., min_length=1, description="Technical justification for exception")
     requested_by: str = Field(
         default="vuln-exception-requester",
@@ -70,5 +78,7 @@ class ApprovalDecision(BaseModel):
     expires_at: datetime | None = None
     remediation_sla_deadline: datetime | None = None
     remediation_sla_days: int | None = None
+    compensating_control_active: bool = False
+    compensating_control_ref: str | None = None
     evaluated_by: str = "vuln-exception-approver"
     evaluated_at: datetime = Field(default_factory=_utc_now)

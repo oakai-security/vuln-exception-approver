@@ -265,3 +265,24 @@ def test_update_register_batch(tmp_path):
     assert data["total_tracked"] == 4
     assert data["active_exceptions"] == 2
     assert len(data["vulnerabilities"]) == 4
+
+
+def test_compensating_control_approval():
+    """Verify that a high-EPSS finding is conditionally approved when compensating control is active."""
+    request = ApprovalRequest(
+        cve_id="CVE-2024-38077",
+        package_name="libarchive13",
+        installed_version="3.6.2",
+        severity="CRITICAL",
+        epss_score=0.85,
+        in_memory=False,
+        ticket_path="/tmp/test.md",
+        compensating_control_active=True,
+        compensating_control_ref="falco_cve_2024_38077_mitigation",
+        justification="Falco eBPF rule deployed",
+    )
+    decision = evaluate_exception_request(request)
+    assert decision.status == ApprovalStatus.APPROVED
+    assert decision.compensating_control_active is True
+    assert "Conditional exception approved" in decision.decision_reason
+    assert decision.expires_at is not None

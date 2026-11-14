@@ -29,7 +29,7 @@ class GitManager:
         try:
             # Stage modified files
             subprocess.run(
-                ["git", "add", "tickets/", "register/"],
+                ["git", "-c", "safe.directory=*", "add", "tickets/", "register/"],
                 cwd=self.repo_dir,
                 capture_output=True,
                 text=True,
@@ -39,7 +39,7 @@ class GitManager:
 
             # Check if there are staged changes
             status_res = subprocess.run(
-                ["git", "status", "--porcelain"],
+                ["git", "-c", "safe.directory=*", "status", "--porcelain"],
                 cwd=self.repo_dir,
                 capture_output=True,
                 text=True,
@@ -56,7 +56,18 @@ class GitManager:
                 f"chore(governance): {status_lower} exception for {decision.cve_id} ({decision.package_name})"
             )
             subprocess.run(
-                ["git", "commit", "-m", commit_msg],
+                [
+                    "git",
+                    "-c",
+                    "safe.directory=*",
+                    "-c",
+                    "user.name=vuln-exception-approver",
+                    "-c",
+                    "user.email=pipeline@oakai.local",
+                    "commit",
+                    "-m",
+                    commit_msg,
+                ],
                 cwd=self.repo_dir,
                 capture_output=True,
                 text=True,
@@ -67,7 +78,7 @@ class GitManager:
 
             if self.auto_push:
                 subprocess.run(
-                    ["git", "push"],
+                    ["git", "-c", "safe.directory=*", "push"],
                     cwd=self.repo_dir,
                     capture_output=True,
                     text=True,

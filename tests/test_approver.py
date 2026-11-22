@@ -286,3 +286,24 @@ def test_compensating_control_approval():
     assert decision.compensating_control_active is True
     assert "Conditional exception approved" in decision.decision_reason
     assert decision.expires_at is not None
+
+
+def test_partial_memory_visibility_withholds_approval():
+    """in_memory=False with partial host visibility must not be auto-approved."""
+    from vuln_exception_approver.decision_engine import evaluate_exception_request
+    from vuln_exception_approver.schemas import ApprovalRequest, ApprovalStatus
+
+    req = ApprovalRequest(
+        cve_id="CVE-2024-1111",
+        package_name="wget",
+        installed_version="1.0",
+        severity="LOW",
+        epss_score=0.001,
+        in_memory=False,
+        ticket_path="/tmp/x.md",
+        justification="test",
+        memory_visibility="partial",
+    )
+    assert evaluate_exception_request(req).status == ApprovalStatus.PENDING_REVIEW
+    req_full = req.model_copy(update={"memory_visibility": "full"})
+    assert evaluate_exception_request(req_full).status == ApprovalStatus.APPROVED

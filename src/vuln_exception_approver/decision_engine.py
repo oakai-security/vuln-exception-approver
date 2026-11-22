@@ -102,6 +102,25 @@ def evaluate_exception_request(request: ApprovalRequest) -> ApprovalDecision:
             evaluated_at=now,
         )
 
+    # Gate 2b: A negative memory result is only trustworthy with full host visibility.
+    # Without it (rootless pod cannot read other users' /proc/<pid>/maps), withhold approval.
+    if request.memory_visibility != "full":
+        reason = (
+            "Approval withheld: in_memory=False was determined with PARTIAL host visibility "
+            "(root-owned processes could not be inspected). Re-evaluate once the oakai-memscan "
+            "root snapshot is available."
+        )
+        logger.warning("[%s] Pending: memory visibility is %s", request.cve_id, request.memory_visibility)
+        return ApprovalDecision(
+            cve_id=request.cve_id,
+            package_name=request.package_name,
+            status=ApprovalStatus.PENDING_REVIEW,
+            decision_reason=reason,
+            epss_score=request.epss_score,
+            in_memory=False,
+            evaluated_at=now,
+        )
+
     # Gate 3: Both deterministic checks passed -> Approve
     expires_at, lifespan_days = calculate_expiration(request.severity, from_date=now)
     reason = (

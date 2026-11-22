@@ -15,6 +15,7 @@ class ApprovalStatus(StrEnum):
 
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    PENDING_REVIEW = "PENDING_REVIEW"
     REVOKED = "REVOKED"
     EXPIRED = "EXPIRED"
 
@@ -31,6 +32,10 @@ class ApprovalRequest(BaseModel):
     epss_score: float = Field(..., ge=0.0, le=1.0, description="FIRST.org EPSS exploit probability")
     in_memory: bool = Field(..., description="True if executable mapped in active Linux process memory")
     ticket_path: str = Field(..., description="Path to the Markdown exception ticket")
+    memory_visibility: str = Field(
+        default="full",
+        description="'full' if in_memory covers all host processes, 'partial' if root-owned processes were not checked",
+    )
     remediation_attempted: bool = Field(
         default=True,
         description="True if automated patching and safe purging were attempted and failed",

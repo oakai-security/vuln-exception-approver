@@ -15,8 +15,43 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def parse_ticket_frontmatter(ticket_path: Path) -> dict[str, Any]:
+    """Read and parse YAML frontmatter from an actual Markdown exception ticket on disk."""
+    if not ticket_path.exists():
+        return {}
+
+    try:
+        content = ticket_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {}
+
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+
+    meta: dict[str, Any] = {}
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if ":" in stripped:
+            key, val = stripped.split(":", 1)
+            k = key.strip()
+            v = val.strip().strip("'").strip('"')
+            if v.lower() == "true":
+                meta[k] = True
+            elif v.lower() == "false":
+                meta[k] = False
+            else:
+                try:
+                    meta[k] = float(v) if "." in v else int(v)
+                except ValueError:
+                    meta[k] = v
+    return meta
+
+
 def update_ticket_markdown(ticket_path: Path, decision: ApprovalDecision) -> bool:
-    """Update the frontmatter and audit log of a Markdown exception ticket."""
+    """Update ONLY the YAML frontmatter and audit log of a Markdown exception ticket."""
     if not ticket_path.exists():
         logger.error("Ticket file does not exist: %s", ticket_path)
         return False
@@ -29,6 +64,7 @@ def update_ticket_markdown(ticket_path: Path, decision: ApprovalDecision) -> boo
 
     lines = content.splitlines()
     in_frontmatter = False
+    frontmatter_done = False
     new_lines: list[str] = []
 
     expires_str = (
@@ -42,15 +78,24 @@ def update_ticket_markdown(ticket_path: Path, decision: ApprovalDecision) -> boo
         else ""
     )
 
+    leaked_keys = (
+        "approval_status:",
+        "approver:",
+        "evaluated_at:",
+        "expires_at:",
+        "remediation_deadline:",
+    )
+
     for line in lines:
-        if line.strip() == "---":
+        if line.strip() == "---" and not frontmatter_done:
             if not in_frontmatter:
                 in_frontmatter = True
                 new_lines.append(line)
                 continue
             else:
                 in_frontmatter = False
-                # Inject updated frontmatter keys before closing delimiter
+                frontmatter_done = True
+                # Inject updated frontmatter keys before closing frontmatter delimiter
                 new_lines.append(f"approval_status: {decision.status.value}")
                 new_lines.append("approver: vuln-exception-approver")
                 new_lines.append(
@@ -64,22 +109,40 @@ def update_ticket_markdown(ticket_path: Path, decision: ApprovalDecision) -> boo
                 continue
 
         if in_frontmatter:
-            # Update status key in frontmatter if present
             if line.strip().startswith("status:"):
-                mapped_status = (
-                    "approved"
-                    if decision.status == ApprovalStatus.APPROVED
-                    else "remediation_required"
-                )
+                if decision.status == ApprovalStatus.APPROVED:
+                    mapped_status = "approved"
+                elif decision.status == ApprovalStatus.PENDING_REVIEW:
+                    mapped_status = "pending_review"
+                else:
+                    mapped_status = "remediation_required"
                 new_lines.append(f"status: {mapped_status}")
                 continue
-            if line.strip().startswith(
-                ("approval_status:", "approver:", "evaluated_at:", "expires_at:", "remediation_deadline:")
+            if line.strip().startswith(leaked_keys):
+                continue
+        else:
+            # Clean up any previously leaked YAML keys in the Markdown body
+            if line.strip().startswith(leaked_keys) or line.strip().startswith(
+                ("compensating_control_active:", "compensating_control_ref:", "compensating_control_file:")
             ):
-                # Skip older injected keys
                 continue
 
         new_lines.append(line)
+
+    # Strip any prior Governance Decision & Audit Record section before appending latest decision
+    cleaned_lines: list[str] = []
+    skip_section = False
+    for line in new_lines:
+        if line.strip() == "## Governance Decision & Audit Record":
+            skip_section = True
+            continue
+        if skip_section and line.startswith("## "):
+            skip_section = False
+        if not skip_section:
+            cleaned_lines.append(line)
+
+    while cleaned_lines and not cleaned_lines[-1].strip():
+        cleaned_lines.pop()
 
     # Append Governance Review Audit Section
     audit_section = [
@@ -100,7 +163,7 @@ def update_ticket_markdown(ticket_path: Path, decision: ApprovalDecision) -> boo
             f"- **Mandatory Remediation SLA Deadline**: `{deadline_str}` ({decision.remediation_sla_days} days)"
         )
 
-    updated_content = "\n".join(new_lines) + "\n" + "\n".join(audit_section) + "\n"
+    updated_content = "\n".join(cleaned_lines) + "\n" + "\n".join(audit_section) + "\n"
 
     try:
         ticket_path.write_text(updated_content, encoding="utf-8")
@@ -171,6 +234,7 @@ def update_register_batch_json(
                 entry["evaluated_at"] = decision.evaluated_at.isoformat()
                 entry["decision_reason"] = decision.decision_reason
                 entry["expires_at"] = expires_str
+                entry["expiration"] = expires_str or deadline_str or "N/A"
                 entry["remediation_deadline"] = deadline_str
                 entry_found = True
                 break
@@ -187,6 +251,7 @@ def update_register_batch_json(
                     "evaluated_at": decision.evaluated_at.isoformat(),
                     "decision_reason": decision.decision_reason,
                     "expires_at": expires_str,
+                    "expiration": expires_str or deadline_str or "N/A",
                     "remediation_deadline": deadline_str,
                 }
             )
@@ -241,7 +306,6 @@ def update_register_batch_markdown(
     new_lines: list[str] = []
     any_updated = False
 
-    # Map of (cve_id, package_name) to decision
     decision_map = {(d.cve_id, d.package_name): d for d in decisions}
 
     for line in lines:

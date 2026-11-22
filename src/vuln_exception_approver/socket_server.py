@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import struct
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from pydantic import ValidationError
 from vuln_exception_approver.decision_engine import evaluate_exception_request
 from vuln_exception_approver.git_manager import GitManager
 from vuln_exception_approver.register_updater import (
+    parse_ticket_frontmatter,
     update_register_batch_json,
     update_register_batch_markdown,
     update_ticket_markdown,
@@ -28,21 +30,24 @@ from vuln_exception_approver.schemas import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_APPROVE_SOCKET = os.environ.get("UDS_APPROVE_SOCKET", "/run/oakai/approve.sock")
+DEFAULT_MITIGATE_SOCKET = os.environ.get("UDS_MITIGATE_SOCKET", "/run/oakai/mitigate.sock")
 DEFAULT_REGISTER_REPO = os.environ.get(
     "VULN_REGISTER_PATH", "/home/curt/dev/repos/vuln-register"
 )
 
 
 class UdsApproverServer:
-    """UDS server that receives exception requests, evaluates risk gates, and updates register."""
+    """UDS server that receives exception requests, reads tickets, evaluates gates, and updates register."""
 
     def __init__(
         self,
         socket_path: str = DEFAULT_APPROVE_SOCKET,
+        mitigate_socket_path: str = DEFAULT_MITIGATE_SOCKET,
         register_repo_path: str = DEFAULT_REGISTER_REPO,
         auto_push: bool = False,
     ):
         self.socket_path = socket_path
+        self.mitigate_socket_path = mitigate_socket_path
         self.repo_dir = Path(register_repo_path)
         self.git_manager = GitManager(self.repo_dir, auto_push=auto_push)
         self._running = False
@@ -93,6 +98,8 @@ class UdsApproverServer:
 
     def _handle_client(self, conn: socket.socket):
         """Process incoming requests, evaluate governance gates, update register, and reply."""
+        rejected_for_mitigation: list[dict[str, Any]] = []
+
         with conn:
             peer_info = self._get_peer_credentials(conn)
             logger.info("Accepted connection from: %s", peer_info)
@@ -114,9 +121,11 @@ class UdsApproverServer:
 
                 decisions: list[ApprovalDecision] = []
                 for item in items:
-                    decision = self._process_single_request(item)
+                    decision, mit_payload = self._process_single_request(item)
                     if decision:
                         decisions.append(decision)
+                    if mit_payload:
+                        rejected_for_mitigation.append(mit_payload)
 
                 if decisions:
                     register_json = self.repo_dir / "register" / "vulnerability_register.json"
@@ -148,31 +157,108 @@ class UdsApproverServer:
                 logger.error("Error processing approval request: %s", err)
                 conn.sendall(json.dumps({"error": str(err)}).encode("utf-8"))
 
-    def _process_single_request(self, item: dict[str, Any]) -> ApprovalDecision:
-        """Parse item into ApprovalRequest, evaluate decision, and apply updates."""
-        # Normalize input whether from ExceptionTicket or direct ApprovalRequest
-        cve_id = item.get("cve_id", "")
-        pkg = item.get("package_name", "")
-        installed_ver = item.get("installed_version", "unknown")
-        severity = item.get("severity", item.get("threat_level", "MEDIUM"))
-        epss = float(item.get("epss_score", 0.0))
-        in_mem = bool(item.get("in_memory", False))
-        comp_active = bool(item.get("compensating_control_active", False))
-        comp_ref = item.get("compensating_control_ref", None)
+        # Asynchronously dispatch rejected non-in-memory high-EPSS tickets to mitigation analyst
+        if rejected_for_mitigation and os.path.exists(self.mitigate_socket_path):
+            threading.Thread(
+                target=self._forward_to_mitigation,
+                args=(rejected_for_mitigation,),
+                daemon=True,
+            ).start()
 
-        ticket_id = item.get("id", item.get("ticket_id", ""))
-        rel_ticket_path = item.get("ticket_path", "")
-        if not rel_ticket_path and ticket_id:
-            rel_ticket_path = f"tickets/{ticket_id}.md"
+    def _resolve_ticket_path(
+        self, item: dict[str, Any], cve_id: str, pkg: str
+    ) -> Path:
+        """Resolve full path to the actual EXC-XXXX.md ticket file on disk."""
+        ticket_id = str(item.get("id", item.get("ticket_id", ""))).strip()
+        rel_ticket_path = str(item.get("ticket_path", "")).strip()
 
-        full_ticket_path = (
+        if rel_ticket_path:
+            p = Path(rel_ticket_path)
+            if p.is_absolute() and p.exists():
+                return p
+            cand = self.repo_dir / rel_ticket_path.lstrip("/")
+            if cand.exists():
+                return cand
+
+        if ticket_id:
+            cand = self.repo_dir / "tickets" / f"{ticket_id}.md"
+            if cand.exists():
+                return cand
+
+        # Search register or tickets dir for matching (cve_id, package_name)
+        tickets_dir = self.repo_dir / "tickets"
+        if tickets_dir.exists() and cve_id and pkg:
+            for f in sorted(tickets_dir.glob("EXC-*.md")):
+                meta = parse_ticket_frontmatter(f)
+                if meta.get("cve_id") == cve_id and meta.get("package_name") == pkg:
+                    return f
+
+        return (
             self.repo_dir / rel_ticket_path
             if rel_ticket_path
-            else self.repo_dir / f"tickets/{ticket_id}.md"
+            else self.repo_dir / f"tickets/{ticket_id or 'EXC-0000'}.md"
         )
-        justification = item.get(
-            "justification",
-            item.get("remediation_attempt_summary", "Automated remediation attempted"),
+
+    def _process_single_request(
+        self, item: dict[str, Any]
+    ) -> tuple[ApprovalDecision, dict[str, Any] | None]:
+        """Read actual ticket frontmatter from disk, evaluate decision, and apply updates."""
+        cve_id = str(item.get("cve_id", ""))
+        pkg = str(item.get("package_name", ""))
+        full_ticket_path = self._resolve_ticket_path(item, cve_id, pkg)
+
+        # Read ground-truth attributes from actual ticket file on disk if present
+        ticket_meta = parse_ticket_frontmatter(full_ticket_path)
+        if ticket_meta:
+            logger.info(
+                "Read actual ticket file %s for %s (%s)",
+                full_ticket_path.name,
+                ticket_meta.get("cve_id", cve_id),
+                ticket_meta.get("package_name", pkg),
+            )
+
+        cve_id = str(cve_id or ticket_meta.get("cve_id", ""))
+        pkg = str(pkg or ticket_meta.get("package_name", ""))
+        installed_ver = str(
+            item.get("installed_version")
+            or ticket_meta.get("installed_version", "unknown")
+        )
+        severity = str(
+            item.get("severity")
+            or item.get("threat_level")
+            or ticket_meta.get("threat_level", "MEDIUM")
+        )
+        epss = float(
+            item.get("epss_score")
+            if "epss_score" in item
+            else ticket_meta.get("epss_score", 0.0)
+        )
+        in_mem = bool(
+            item.get("in_memory")
+            if "in_memory" in item
+            else ticket_meta.get("in_memory", False)
+        )
+        mem_visibility = str(
+            item.get("memory_visibility")
+            or ticket_meta.get("memory_visibility", "partial")
+        )
+        comp_active = bool(
+            item.get("compensating_control_active")
+            if "compensating_control_active" in item
+            else ticket_meta.get("compensating_control_active", False)
+        )
+        comp_ref = (
+            item.get("compensating_control_ref")
+            or ticket_meta.get("compensating_control_ref", None)
+        )
+        if comp_ref is not None:
+            comp_ref = str(comp_ref)
+
+        justification = str(
+            item.get("justification")
+            or item.get("reason")
+            or item.get("remediation_attempt_summary")
+            or "Automated remediation attempted"
         )
 
         request = ApprovalRequest(
@@ -182,6 +268,7 @@ class UdsApproverServer:
             severity=severity,
             epss_score=epss,
             in_memory=in_mem,
+            memory_visibility=mem_visibility,
             ticket_path=str(full_ticket_path),
             compensating_control_active=comp_active,
             compensating_control_ref=comp_ref,
@@ -191,11 +278,44 @@ class UdsApproverServer:
 
         decision = evaluate_exception_request(request)
 
-        # Update ticket markdown
         if full_ticket_path.exists():
             update_ticket_markdown(full_ticket_path, decision)
 
-        return decision
+        mit_payload = None
+        if (
+            decision.status == ApprovalStatus.REJECTED
+            and not in_mem
+            and epss >= 0.05
+            and not comp_active
+        ):
+            mit_payload = {
+                "cve_id": cve_id,
+                "package_name": pkg,
+                "installed_version": installed_ver,
+                "epss_score": epss,
+                "ticket_path": str(full_ticket_path),
+            }
+
+        return decision, mit_payload
+
+    def _forward_to_mitigation(self, payloads: list[dict[str, Any]]):
+        """Route rejected high-EPSS non-in-memory tickets to vuln-mitigation-analyst."""
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(self.mitigate_socket_path)
+                client.sendall(json.dumps(payloads).encode("utf-8"))
+                client.shutdown(socket.SHUT_WR)
+                client.recv(8192)
+                logger.info(
+                    "Auto-forwarded %d rejected high-EPSS tickets to mitigation analyst",
+                    len(payloads),
+                )
+        except OSError as err:
+            logger.warning(
+                "Mitigation socket %s unreachable: %s",
+                self.mitigate_socket_path,
+                err,
+            )
 
     def _get_peer_credentials(self, conn: socket.socket) -> str:
         """Inspect SO_PEERCRED on Linux."""

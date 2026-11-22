@@ -32,6 +32,33 @@ def evaluate_exception_request(request: ApprovalRequest) -> ApprovalDecision:
 
     # Gate 1: Check active memory residency
     if request.in_memory:
+        if request.compensating_control_active:
+            ctrl_ref = request.compensating_control_ref or "verified runtime Falco eBPF rule"
+            expires_at, lifespan_days = calculate_expiration("HIGH", from_date=now)
+            reason = (
+                f"Conditional exception approved: Vulnerable library is active in memory, but "
+                f"verified compensating control ({ctrl_ref}) is active in runtime. Valid for "
+                f"{lifespan_days} days under telemetry."
+            )
+            logger.info(
+                "[%s] Conditionally approved via compensating control for in-memory asset: %s",
+                request.cve_id,
+                ctrl_ref,
+            )
+            return ApprovalDecision(
+                cve_id=request.cve_id,
+                package_name=request.package_name,
+                status=ApprovalStatus.APPROVED,
+                decision_reason=reason,
+                epss_score=request.epss_score,
+                in_memory=True,
+                approved_at=now,
+                expires_at=expires_at,
+                compensating_control_active=True,
+                compensating_control_ref=ctrl_ref,
+                evaluated_at=now,
+            )
+
         reason = (
             "Exception rejected: Vulnerable binary or library is loaded in active system "
             "process memory (/proc/<pid>/maps verification confirmed)."

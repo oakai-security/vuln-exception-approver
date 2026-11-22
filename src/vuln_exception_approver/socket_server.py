@@ -282,12 +282,7 @@ class UdsApproverServer:
             update_ticket_markdown(full_ticket_path, decision)
 
         mit_payload = None
-        if (
-            decision.status == ApprovalStatus.REJECTED
-            and not in_mem
-            and epss >= 0.05
-            and not comp_active
-        ):
+        if decision.status == ApprovalStatus.REJECTED and not comp_active:
             mit_payload = {
                 "cve_id": cve_id,
                 "package_name": pkg,
